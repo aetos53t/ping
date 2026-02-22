@@ -7,53 +7,18 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
+import { prettyJSON } from 'hono/pretty-json';
 import * as ed from '@noble/ed25519';
 import { sha512 } from '@noble/hashes/sha512';
+import { db, type Agent, type Message } from './db';
 
 // Required for @noble/ed25519 v2
 ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
 
 const app = new Hono();
 
-// ════════════════════════════════════════════════════════════════
-//                         STORAGE (in-memory for MVP)
-// ════════════════════════════════════════════════════════════════
-
-interface Agent {
-  id: string;
-  publicKey: string;
-  name: string;
-  provider?: string;
-  capabilities: string[];
-  webhookUrl?: string;
-  createdAt: number;
-  isPublic: boolean;
-}
-
-interface Message {
-  id: string;
-  type: string;
-  from: string;
-  to: string;
-  payload: any;
-  replyTo?: string;
-  timestamp: number;
-  signature: string;
-  delivered: boolean;
-  acknowledged: boolean;
-}
-
-interface Contact {
-  agentId: string;
-  contactId: string;
-  alias?: string;
-  notes?: string;
-  addedAt: number;
-}
-
-const agents = new Map<string, Agent>();
-const messages: Message[] = [];
-const contacts: Contact[] = [];
+// WebSocket connections for real-time delivery
+const wsConnections = new Map<string, Set<WebSocket>>();
 
 // ════════════════════════════════════════════════════════════════
 //                         MIDDLEWARE
@@ -61,32 +26,13 @@ const contacts: Contact[] = [];
 
 app.use('*', cors());
 app.use('*', logger());
+if (process.env.NODE_ENV !== 'production') {
+  app.use('*', prettyJSON());
+}
 
 // ════════════════════════════════════════════════════════════════
 //                         UTILITIES
 // ════════════════════════════════════════════════════════════════
-
-function generateId(): string {
-  return crypto.randomUUID();
-}
-
-function verifySignature(message: any, signature: string, publicKey: string): boolean {
-  try {
-    const msgBytes = new TextEncoder().encode(JSON.stringify({
-      type: message.type,
-      from: message.from,
-      to: message.to,
-      payload: message.payload,
-      replyTo: message.replyTo,
-      timestamp: message.timestamp,
-    }));
-    const sigBytes = hexToBytes(signature);
-    const pubBytes = hexToBytes(publicKey);
-    return ed.verify(sigBytes, msgBytes, pubBytes);
-  } catch {
-    return false;
-  }
-}
 
 function hexToBytes(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2);
@@ -96,36 +42,109 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+function verifySignature(message: any, signature: string, publicKey: string): boolean {
+  try {
+    const msgBytes = new TextEncoder().encode(JSON.stringify({
+      type: message.type,
+      from: message.from_agent || message.from,
+      to: message.to_agent || message.to,
+      payload: message.payload,
+      replyTo: message.reply_to || message.replyTo,
+      timestamp: message.timestamp,
+    }));
+    const sigBytes = hexToBytes(signature);
+    const pubBytes = hexToBytes(publicKey);
+    return ed.verify(sigBytes, msgBytes, pubBytes);
+  } catch (err) {
+    console.error('[verify] Error:', err);
+    return false;
+  }
 }
 
 async function deliverWebhook(agent: Agent, message: Message): Promise<boolean> {
-  if (!agent.webhookUrl) return false;
+  if (!agent.webhook_url) return false;
   
   try {
-    const res = await fetch(agent.webhookUrl, {
+    const res = await fetch(agent.webhook_url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(message),
+      headers: { 
+        'Content-Type': 'application/json',
+        'X-Ping-Message-Id': message.id,
+        'X-Ping-From': message.from_agent,
+      },
+      body: JSON.stringify({
+        id: message.id,
+        type: message.type,
+        from: message.from_agent,
+        to: message.to_agent,
+        payload: message.payload,
+        replyTo: message.reply_to,
+        timestamp: message.created_at,
+        signature: message.signature,
+      }),
     });
     return res.ok;
-  } catch {
+  } catch (err) {
+    console.error('[webhook] Delivery failed:', err);
     return false;
   }
+}
+
+function deliverWebSocket(agentId: string, message: Message): boolean {
+  const connections = wsConnections.get(agentId);
+  if (!connections || connections.size === 0) return false;
+
+  const payload = JSON.stringify({
+    type: 'message',
+    data: {
+      id: message.id,
+      type: message.type,
+      from: message.from_agent,
+      to: message.to_agent,
+      payload: message.payload,
+      replyTo: message.reply_to,
+      timestamp: message.created_at,
+      signature: message.signature,
+    },
+  });
+
+  let delivered = false;
+  for (const ws of connections) {
+    try {
+      ws.send(payload);
+      delivered = true;
+    } catch (err) {
+      console.error('[ws] Send failed:', err);
+      connections.delete(ws);
+    }
+  }
+
+  return delivered;
 }
 
 // ════════════════════════════════════════════════════════════════
 //                         ROUTES: HEALTH
 // ════════════════════════════════════════════════════════════════
 
-app.get('/health', (c) => {
+app.get('/', async (c) => {
+  const stats = await db.getStats();
+  return c.json({
+    name: 'PING',
+    version: '0.1.0',
+    description: 'Agent-to-Agent Messenger',
+    docs: 'https://github.com/aetos53t/ping',
+    stats,
+  });
+});
+
+app.get('/health', async (c) => {
+  const stats = await db.getStats();
   return c.json({
     status: 'ok',
     service: 'ping',
     version: '0.1.0',
-    agents: agents.size,
-    messages: messages.length,
+    ...stats,
+    wsConnections: Array.from(wsConnections.values()).reduce((sum, set) => sum + set.size, 0),
   });
 });
 
@@ -142,62 +161,100 @@ app.post('/agents', async (c) => {
   if (!publicKey || !name) {
     return c.json({ error: 'publicKey and name required' }, 400);
   }
-  
-  // Check if publicKey already registered
-  for (const agent of agents.values()) {
-    if (agent.publicKey === publicKey) {
-      return c.json({ error: 'Agent with this publicKey already exists', id: agent.id }, 409);
-    }
+
+  // Validate publicKey format (should be 64 hex chars for Ed25519)
+  if (!/^[0-9a-fA-F]{64}$/.test(publicKey)) {
+    return c.json({ error: 'Invalid publicKey format. Expected 64 hex characters (Ed25519 public key)' }, 400);
   }
   
-  const agent: Agent = {
-    id: generateId(),
-    publicKey,
+  // Check if publicKey already registered
+  const existing = await db.getAgentByPublicKey(publicKey);
+  if (existing) {
+    return c.json({ error: 'Agent with this publicKey already exists', id: existing.id }, 409);
+  }
+  
+  const agent = await db.createAgent({
+    public_key: publicKey.toLowerCase(),
     name,
     provider: provider || 'unknown',
     capabilities: capabilities || [],
-    webhookUrl,
-    createdAt: Date.now(),
-    isPublic: isPublic ?? false,
-  };
+    webhook_url: webhookUrl || null,
+    is_public: isPublic ?? false,
+  });
   
-  agents.set(agent.id, agent);
-  
-  return c.json(agent, 201);
+  return c.json({
+    id: agent.id,
+    publicKey: agent.public_key,
+    name: agent.name,
+    provider: agent.provider,
+    capabilities: agent.capabilities,
+    webhookUrl: agent.webhook_url,
+    isPublic: agent.is_public,
+    createdAt: agent.created_at,
+  }, 201);
 });
 
 // Get agent by ID
-app.get('/agents/:id', (c) => {
-  const agent = agents.get(c.req.param('id'));
+app.get('/agents/:id', async (c) => {
+  const agent = await db.getAgent(c.req.param('id'));
   if (!agent) {
     return c.json({ error: 'Agent not found' }, 404);
   }
-  return c.json(agent);
+  return c.json({
+    id: agent.id,
+    publicKey: agent.public_key,
+    name: agent.name,
+    provider: agent.provider,
+    capabilities: agent.capabilities,
+    webhookUrl: agent.webhook_url,
+    isPublic: agent.is_public,
+    createdAt: agent.created_at,
+  });
 });
 
 // Update agent
 app.patch('/agents/:id', async (c) => {
-  const agent = agents.get(c.req.param('id'));
+  const id = c.req.param('id');
+  const agent = await db.getAgent(id);
   if (!agent) {
     return c.json({ error: 'Agent not found' }, 404);
   }
   
   const body = await c.req.json();
-  const { signature, ...updates } = body;
+  const { signature, timestamp, ...updates } = body;
   
-  // TODO: Verify signature proves ownership
+  // Verify ownership via signature
+  if (signature && timestamp) {
+    const msgBytes = new TextEncoder().encode(JSON.stringify({ agentId: id, timestamp }));
+    try {
+      const isValid = ed.verify(hexToBytes(signature), msgBytes, hexToBytes(agent.public_key));
+      if (!isValid) {
+        return c.json({ error: 'Invalid signature' }, 401);
+      }
+    } catch {
+      return c.json({ error: 'Invalid signature format' }, 400);
+    }
+  }
   
-  Object.assign(agent, updates);
-  return c.json(agent);
+  // Map camelCase to snake_case
+  const dbUpdates: any = {};
+  if (updates.name) dbUpdates.name = updates.name;
+  if (updates.provider) dbUpdates.provider = updates.provider;
+  if (updates.capabilities) dbUpdates.capabilities = updates.capabilities;
+  if (updates.webhookUrl !== undefined) dbUpdates.webhook_url = updates.webhookUrl;
+  if (updates.isPublic !== undefined) dbUpdates.is_public = updates.isPublic;
+
+  const updated = await db.updateAgent(id, dbUpdates);
+  return c.json(updated);
 });
 
 // Delete agent
-app.delete('/agents/:id', (c) => {
+app.delete('/agents/:id', async (c) => {
   const id = c.req.param('id');
-  if (!agents.has(id)) {
+  const deleted = await db.deleteAgent(id);
+  if (!deleted) {
     return c.json({ error: 'Agent not found' }, 404);
   }
-  agents.delete(id);
   return c.json({ success: true });
 });
 
@@ -206,41 +263,23 @@ app.delete('/agents/:id', (c) => {
 // ════════════════════════════════════════════════════════════════
 
 // Public directory
-app.get('/directory', (c) => {
-  const publicAgents = Array.from(agents.values())
-    .filter(a => a.isPublic)
-    .map(a => ({
-      id: a.id,
-      name: a.name,
-      provider: a.provider,
-      capabilities: a.capabilities,
-    }));
-  
-  return c.json(publicAgents);
+app.get('/directory', async (c) => {
+  const agents = await db.getPublicAgents();
+  return c.json(agents.map(a => ({
+    id: a.id,
+    name: a.name,
+    provider: a.provider,
+    capabilities: a.capabilities,
+  })));
 });
 
 // Search directory
-app.get('/directory/search', (c) => {
-  const query = c.req.query('q')?.toLowerCase();
-  const capability = c.req.query('capability');
-  const provider = c.req.query('provider');
-  
-  let results = Array.from(agents.values()).filter(a => a.isPublic);
-  
-  if (query) {
-    results = results.filter(a => 
-      a.name.toLowerCase().includes(query) ||
-      a.id.toLowerCase().includes(query)
-    );
-  }
-  
-  if (capability) {
-    results = results.filter(a => a.capabilities.includes(capability));
-  }
-  
-  if (provider) {
-    results = results.filter(a => a.provider === provider);
-  }
+app.get('/directory/search', async (c) => {
+  const results = await db.searchAgents({
+    query: c.req.query('q'),
+    capability: c.req.query('capability'),
+    provider: c.req.query('provider'),
+  });
   
   return c.json(results.map(a => ({
     id: a.id,
@@ -255,65 +294,80 @@ app.get('/directory/search', (c) => {
 // ════════════════════════════════════════════════════════════════
 
 // Get contacts for an agent
-app.get('/agents/:id/contacts', (c) => {
+app.get('/agents/:id/contacts', async (c) => {
   const agentId = c.req.param('id');
-  const agentContacts = contacts
-    .filter(c => c.agentId === agentId)
-    .map(c => {
-      const contact = agents.get(c.contactId);
-      return {
-        ...c,
-        contact: contact ? { id: contact.id, name: contact.name, provider: contact.provider } : null,
-      };
-    });
-  
-  return c.json(agentContacts);
+  const agent = await db.getAgent(agentId);
+  if (!agent) {
+    return c.json({ error: 'Agent not found' }, 404);
+  }
+
+  const contacts = await db.getContacts(agentId);
+  return c.json(contacts.map(c => ({
+    contactId: c.contact_id,
+    alias: c.alias,
+    notes: c.notes,
+    addedAt: c.created_at,
+    contact: c.contact ? {
+      id: c.contact.id,
+      name: c.contact.name,
+      provider: c.contact.provider,
+      capabilities: c.contact.capabilities,
+    } : null,
+  })));
 });
 
 // Add contact
 app.post('/agents/:id/contacts', async (c) => {
   const agentId = c.req.param('id');
-  const body = await c.req.json();
-  
-  if (!agents.has(agentId)) {
+  const agent = await db.getAgent(agentId);
+  if (!agent) {
     return c.json({ error: 'Agent not found' }, 404);
   }
   
+  const body = await c.req.json();
   const { contactId, alias, notes } = body;
   
   if (!contactId) {
     return c.json({ error: 'contactId required' }, 400);
   }
+
+  // Verify contact exists
+  const contactAgent = await db.getAgent(contactId);
+  if (!contactAgent) {
+    return c.json({ error: 'Contact agent not found' }, 404);
+  }
   
   // Check if already a contact
-  const existing = contacts.find(c => c.agentId === agentId && c.contactId === contactId);
+  const existing = await db.getContact(agentId, contactId);
   if (existing) {
     return c.json({ error: 'Already a contact' }, 409);
   }
   
-  const contact: Contact = {
-    agentId,
-    contactId,
-    alias,
-    notes,
-    addedAt: Date.now(),
-  };
-  
-  contacts.push(contact);
-  return c.json(contact, 201);
+  const contact = await db.createContact({
+    agent_id: agentId,
+    contact_id: contactId,
+    alias: alias || null,
+    notes: notes || null,
+  });
+
+  return c.json({
+    contactId: contact.contact_id,
+    alias: contact.alias,
+    notes: contact.notes,
+    addedAt: contact.created_at,
+  }, 201);
 });
 
 // Remove contact
-app.delete('/agents/:id/contacts/:contactId', (c) => {
+app.delete('/agents/:id/contacts/:contactId', async (c) => {
   const agentId = c.req.param('id');
   const contactId = c.req.param('contactId');
   
-  const idx = contacts.findIndex(c => c.agentId === agentId && c.contactId === contactId);
-  if (idx === -1) {
+  const deleted = await db.deleteContact(agentId, contactId);
+  if (!deleted) {
     return c.json({ error: 'Contact not found' }, 404);
   }
   
-  contacts.splice(idx, 1);
   return c.json({ success: true });
 });
 
@@ -325,104 +379,132 @@ app.delete('/agents/:id/contacts/:contactId', (c) => {
 app.post('/messages', async (c) => {
   const body = await c.req.json();
   
-  const { type, from, to, payload, replyTo, signature } = body;
+  const { type, from, to, payload, replyTo, timestamp, signature } = body;
   
   if (!type || !from || !to || !signature) {
     return c.json({ error: 'type, from, to, and signature required' }, 400);
   }
   
   // Verify sender exists
-  const sender = agents.get(from);
+  const sender = await db.getAgent(from);
   if (!sender) {
     return c.json({ error: 'Sender agent not found' }, 404);
   }
   
   // Verify recipient exists
-  const recipient = agents.get(to);
+  const recipient = await db.getAgent(to);
   if (!recipient) {
     return c.json({ error: 'Recipient agent not found' }, 404);
   }
-  
-  const message: Message = {
-    id: generateId(),
-    type,
-    from,
-    to,
-    payload: payload || {},
-    replyTo,
-    timestamp: Date.now(),
-    signature,
-    delivered: false,
-    acknowledged: false,
-  };
-  
+
   // Verify signature
-  const isValid = verifySignature(message, signature, sender.publicKey);
+  const messageForSig = { type, from, to, payload, replyTo, timestamp };
+  const isValid = verifySignature(messageForSig, signature, sender.public_key);
   if (!isValid) {
     return c.json({ error: 'Invalid signature' }, 401);
   }
   
-  messages.push(message);
+  const message = await db.createMessage({
+    type,
+    from_agent: from,
+    to_agent: to,
+    payload: payload || {},
+    reply_to: replyTo || null,
+    signature,
+  });
+
+  // Try delivery methods in order
+  let deliveryMethod = 'polling';
   
-  // Try webhook delivery
-  const webhookSuccess = await deliverWebhook(recipient, message);
-  if (webhookSuccess) {
-    message.delivered = true;
+  // 1. Try WebSocket
+  if (deliverWebSocket(to, message)) {
+    await db.markDelivered(message.id);
+    deliveryMethod = 'websocket';
+  }
+  // 2. Try webhook
+  else if (await deliverWebhook(recipient, message)) {
+    await db.markDelivered(message.id);
+    deliveryMethod = 'webhook';
   }
   
   return c.json({
     id: message.id,
-    delivered: message.delivered,
-    deliveryMethod: webhookSuccess ? 'webhook' : 'polling',
+    delivered: message.delivered || deliveryMethod !== 'polling',
+    deliveryMethod,
   }, 201);
 });
 
 // Get inbox (undelivered messages)
-app.get('/agents/:id/inbox', (c) => {
+app.get('/agents/:id/inbox', async (c) => {
   const agentId = c.req.param('id');
-  const includeDelivered = c.req.query('all') === 'true';
+  const includeAll = c.req.query('all') === 'true';
   
-  let inbox = messages.filter(m => m.to === agentId);
+  const agent = await db.getAgent(agentId);
+  if (!agent) {
+    return c.json({ error: 'Agent not found' }, 404);
+  }
+
+  const messages = await db.getInbox(agentId, includeAll);
   
-  if (!includeDelivered) {
-    inbox = inbox.filter(m => !m.acknowledged);
+  // Mark as delivered since they fetched them
+  for (const msg of messages) {
+    if (!msg.delivered) {
+      await db.markDelivered(msg.id);
+    }
   }
   
-  // Mark as delivered (they fetched them)
-  inbox.forEach(m => m.delivered = true);
-  
-  return c.json(inbox);
+  return c.json(messages.map(m => ({
+    id: m.id,
+    type: m.type,
+    from: m.from_agent,
+    to: m.to_agent,
+    payload: m.payload,
+    replyTo: m.reply_to,
+    timestamp: m.created_at,
+    signature: m.signature,
+    delivered: true,
+    acknowledged: m.acknowledged,
+  })));
 });
 
 // Get conversation history with another agent
-app.get('/agents/:id/messages/:otherId', (c) => {
+app.get('/agents/:id/messages/:otherId', async (c) => {
   const agentId = c.req.param('id');
   const otherId = c.req.param('otherId');
   const limit = parseInt(c.req.query('limit') || '50');
   
-  const conversation = messages
-    .filter(m => 
-      (m.from === agentId && m.to === otherId) ||
-      (m.from === otherId && m.to === agentId)
-    )
-    .sort((a, b) => b.timestamp - a.timestamp)
-    .slice(0, limit);
+  const conversation = await db.getConversation(agentId, otherId, limit);
   
-  return c.json(conversation);
+  return c.json(conversation.map(m => ({
+    id: m.id,
+    type: m.type,
+    from: m.from_agent,
+    to: m.to_agent,
+    payload: m.payload,
+    replyTo: m.reply_to,
+    timestamp: m.created_at,
+    signature: m.signature,
+  })));
 });
 
 // Acknowledge message receipt
-app.post('/messages/:id/ack', (c) => {
+app.post('/messages/:id/ack', async (c) => {
   const messageId = c.req.param('id');
-  const message = messages.find(m => m.id === messageId);
+  const message = await db.getMessage(messageId);
   
   if (!message) {
     return c.json({ error: 'Message not found' }, 404);
   }
   
-  message.acknowledged = true;
+  await db.markAcknowledged(messageId);
   return c.json({ success: true });
 });
+
+// ════════════════════════════════════════════════════════════════
+//                         WEBSOCKET (Bun native)
+// ════════════════════════════════════════════════════════════════
+
+// WebSocket upgrade handled by Bun server below
 
 // ════════════════════════════════════════════════════════════════
 //                         SERVER
@@ -430,17 +512,52 @@ app.post('/messages/:id/ack', (c) => {
 
 const port = parseInt(process.env.PORT || '3100');
 
+// Initialize database
+await db.connect();
+
 console.log(`
 ┌─────────────────────────────────────────┐
-│           PING v0.1.0                   │
-│     Agent-to-Agent Messenger            │
+│           🏓 PING v0.1.0                │
+│      Agent-to-Agent Messenger           │
 ├─────────────────────────────────────────┤
 │  Port: ${port.toString().padEnd(31)}│
-│  Agents: ${agents.size.toString().padEnd(29)}│
+│  Database: ${process.env.DATABASE_URL ? 'PostgreSQL' : 'In-memory'.padEnd(27)}│
 └─────────────────────────────────────────┘
 `);
 
+// Bun server with WebSocket support
 export default {
   port,
   fetch: app.fetch,
+  websocket: {
+    open(ws: WebSocket & { data?: { agentId: string } }) {
+      const agentId = ws.data?.agentId;
+      if (!agentId) {
+        ws.close(4001, 'Missing agentId');
+        return;
+      }
+
+      if (!wsConnections.has(agentId)) {
+        wsConnections.set(agentId, new Set());
+      }
+      wsConnections.get(agentId)!.add(ws);
+      console.log(`[ws] Agent ${agentId} connected`);
+    },
+    message(ws: WebSocket & { data?: { agentId: string } }, message: string | Buffer) {
+      // Handle ping/pong or other messages
+      try {
+        const data = JSON.parse(message.toString());
+        if (data.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong' }));
+        }
+      } catch {}
+    },
+    close(ws: WebSocket & { data?: { agentId: string } }) {
+      const agentId = ws.data?.agentId;
+      if (agentId) {
+        wsConnections.get(agentId)?.delete(ws);
+        console.log(`[ws] Agent ${agentId} disconnected`);
+      }
+    },
+  },
 };

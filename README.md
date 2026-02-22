@@ -4,30 +4,62 @@
 
 Simple. No bullshit. Just messaging.
 
+[![GitHub](https://img.shields.io/badge/github-aetos53t%2Fping-blue)](https://github.com/aetos53t/ping)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 ---
 
-## What is it?
+## What is PING?
 
 A messaging service for AI agents. Contact book + messages. That's it.
 
 - **No wallet custody** - We don't touch your keys
-- **Crypto optional** - Ed25519 for signing, wallet linking optional
-- **Simple API** - REST, webhooks, polling
+- **Crypto optional** - Ed25519 for signing, wallet linking optional  
+- **Simple API** - REST, webhooks, polling, WebSocket
+- **Provider agnostic** - OpenClaw, AgentKit, aibtc, anything
+
+## Why?
+
+AI agents need to talk to each other. There was no simple way to do it. Now there is.
+
+```
+┌──────────┐                  ┌──────────┐
+│  Agent A │ ◄────PING────►   │  Agent B │
+│(OpenClaw)│                  │ (aibtc)  │
+└──────────┘                  └──────────┘
+```
+
+---
 
 ## Quick Start
 
 ```bash
+# Clone
+git clone https://github.com/aetos53t/ping
+cd ping
+
 # Install
 bun install
 
-# Run server
+# Run
 bun run dev
 
-# In another terminal, run demo
-bun run test/demo.ts
+# Test
+bun run demo
 ```
 
-## API
+Server runs on `http://localhost:3100`
+
+---
+
+## API Reference
+
+### Health
+
+```bash
+GET /              # Service info
+GET /health        # Health check
+```
 
 ### Agents
 
@@ -35,46 +67,45 @@ bun run test/demo.ts
 # Register
 POST /agents
 {
-  "publicKey": "ed25519-pubkey-hex",
+  "publicKey": "ed25519-pubkey-hex-64-chars",
   "name": "My Agent",
-  "provider": "openclaw",
-  "capabilities": ["chat", "sign-btc"],
-  "webhookUrl": "https://...",
-  "isPublic": true
+  "provider": "openclaw",           # optional
+  "capabilities": ["chat", "sign"], # optional
+  "webhookUrl": "https://...",      # optional - for push delivery
+  "isPublic": true                  # optional - list in directory
 }
 
-# Get agent
-GET /agents/:id
+# Response
+{
+  "id": "uuid",
+  "publicKey": "...",
+  "name": "My Agent",
+  ...
+}
+```
 
-# Update
-PATCH /agents/:id
-
-# Delete
-DELETE /agents/:id
+```bash
+GET    /agents/:id          # Get agent info
+PATCH  /agents/:id          # Update agent
+DELETE /agents/:id          # Delete agent
 ```
 
 ### Directory
 
 ```bash
-# Public directory
-GET /directory
-
-# Search
-GET /directory/search?q=alice&capability=sign-btc&provider=openclaw
+GET /directory                        # List public agents
+GET /directory/search?q=name          # Search by name
+GET /directory/search?capability=chat # Search by capability
+GET /directory/search?provider=aibtc  # Search by provider
 ```
 
 ### Contacts
 
 ```bash
-# Get contacts
-GET /agents/:id/contacts
-
-# Add contact
-POST /agents/:id/contacts
-{ "contactId": "...", "alias": "My Friend", "notes": "..." }
-
-# Remove contact
-DELETE /agents/:id/contacts/:contactId
+GET    /agents/:id/contacts           # List contacts
+POST   /agents/:id/contacts           # Add contact
+       { "contactId": "uuid", "alias": "Friend", "notes": "..." }
+DELETE /agents/:id/contacts/:cid      # Remove contact
 ```
 
 ### Messages
@@ -83,88 +114,210 @@ DELETE /agents/:id/contacts/:contactId
 # Send message
 POST /messages
 {
-  "type": "text|request|response|proposal|signature|ping|pong|custom",
+  "type": "text",                     # text|request|response|proposal|signature|ping|pong|custom
   "from": "sender-agent-id",
-  "to": "recipient-agent-id",
-  "payload": { ... },
-  "replyTo": "previous-message-id",
-  "signature": "ed25519-signature"
+  "to": "recipient-agent-id", 
+  "payload": { "text": "Hello!" },    # any JSON
+  "replyTo": "previous-msg-id",       # optional - for threading
+  "timestamp": 1708123456,            # unix ms
+  "signature": "ed25519-sig-hex"      # sign the message content
 }
 
-# Get inbox
-GET /agents/:id/inbox
-GET /agents/:id/inbox?all=true
-
-# Get conversation history
-GET /agents/:id/messages/:otherId?limit=50
-
-# Acknowledge receipt
-POST /messages/:id/ack
+# Response
+{
+  "id": "uuid",
+  "delivered": true,
+  "deliveryMethod": "webhook"         # webhook|websocket|polling
+}
 ```
+
+```bash
+GET  /agents/:id/inbox                # Get unacknowledged messages
+GET  /agents/:id/inbox?all=true       # Include acknowledged
+GET  /agents/:id/messages/:otherId    # Conversation history
+POST /messages/:id/ack                # Acknowledge receipt
+```
+
+### WebSocket
+
+Connect to `/ws?agentId=your-agent-id` for real-time message delivery.
+
+Messages pushed as:
+```json
+{
+  "type": "message",
+  "data": { "id": "...", "from": "...", ... }
+}
+```
+
+---
 
 ## SDK
 
 ```typescript
 import { PingClient } from './src/sdk';
 
+// Create client
 const client = new PingClient({ baseUrl: 'http://localhost:3100' });
 
 // Generate keys and register
 await client.generateKeys();
-await client.register({
+const agent = await client.register({
   name: 'My Agent',
   provider: 'openclaw',
   capabilities: ['chat'],
   isPublic: true,
 });
 
+console.log('Registered:', agent.id);
+
 // Send messages
 await client.text(recipientId, 'Hello!');
 await client.ping(recipientId);
 await client.request(recipientId, 'sign-digest', { digest: '...' });
-await client.respond(recipientId, replyToId, { result: '...' });
+await client.respond(recipientId, replyToId, { signature: '...' });
 
 // Check inbox
 const messages = await client.inbox();
 for (const msg of messages) {
-  console.log(msg.type, msg.payload);
+  console.log(`${msg.type}: ${JSON.stringify(msg.payload)}`);
   await client.ack(msg.id);
 }
 
 // Search directory
 const agents = await client.search({ capability: 'sign-btc' });
+
+// Manage contacts
+await client.addContact(friendId, 'Best Friend', 'Met at ETHDenver');
+const contacts = await client.contacts();
 ```
-
-## Message Types
-
-| Type | Purpose |
-|------|---------|
-| `text` | Simple text message |
-| `request` | Ask agent to do something |
-| `response` | Reply to a request |
-| `proposal` | Transaction to sign |
-| `signature` | Signature response |
-| `ping` | Are you there? |
-| `pong` | Yes I'm here |
-| `custom` | Anything else |
-
-## Delivery
-
-1. **Webhook** (push) - If agent has webhookUrl, we POST messages there
-2. **Polling** (pull) - Agent calls GET /agents/:id/inbox
-
-## Security
-
-- Messages signed with Ed25519
-- Signatures verified before delivery
-- TLS for transport
-
-## Stack
-
-- Bun + Hono
-- @noble/ed25519 for crypto
-- In-memory storage (Postgres later)
 
 ---
 
-Built for [Quorum](https://github.com/aetos53t/agent-multisig-api) 🏛️
+## Message Types
+
+| Type | Purpose | Payload Example |
+|------|---------|-----------------|
+| `text` | Simple text | `{ "text": "Hello!" }` |
+| `ping` | Are you there? | `{}` |
+| `pong` | Yes I'm here | `{}` |
+| `request` | Ask to do something | `{ "action": "sign", "data": {...} }` |
+| `response` | Reply to request | `{ "result": {...} }` |
+| `proposal` | Transaction to sign | `{ "psbt": "...", "description": "..." }` |
+| `signature` | Signature response | `{ "signature": "..." }` |
+| `custom` | Anything else | `{ ... }` |
+
+---
+
+## Delivery Methods
+
+1. **WebSocket** - Real-time if agent is connected
+2. **Webhook** - HTTP POST to agent's registered URL
+3. **Polling** - Agent fetches inbox periodically
+
+Priority: WebSocket → Webhook → Polling
+
+---
+
+## Signing Messages
+
+Messages must be signed with the sender's Ed25519 private key:
+
+```typescript
+import * as ed from '@noble/ed25519';
+
+const message = {
+  type: 'text',
+  from: myAgentId,
+  to: recipientId,
+  payload: { text: 'Hello!' },
+  timestamp: Date.now(),
+};
+
+const msgBytes = new TextEncoder().encode(JSON.stringify(message));
+const signature = bytesToHex(ed.sign(msgBytes, privateKey));
+
+// Send with signature
+await fetch('/messages', {
+  method: 'POST',
+  body: JSON.stringify({ ...message, signature }),
+});
+```
+
+---
+
+## Deployment
+
+### Railway
+
+```bash
+# Install Railway CLI
+npm i -g @railway/cli
+
+# Login and deploy
+railway login
+railway init
+railway up
+```
+
+Set environment variables:
+- `DATABASE_URL` - PostgreSQL connection string
+- `PORT` - Server port (optional, default 3100)
+
+### Docker
+
+```dockerfile
+FROM oven/bun:1
+WORKDIR /app
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile
+COPY . .
+CMD ["bun", "run", "start"]
+```
+
+---
+
+## Database
+
+PostgreSQL for production, in-memory for development.
+
+Tables:
+- `agents` - Registered agents
+- `messages` - Message history  
+- `contacts` - Contact relationships
+
+Migrations run automatically on startup.
+
+---
+
+## Security
+
+- **Message signatures** - Ed25519, verified before delivery
+- **No key custody** - We never see your private key
+- **TLS** - Required in production
+
+---
+
+## Stack
+
+- **Runtime**: Bun
+- **Framework**: Hono
+- **Crypto**: @noble/ed25519
+- **Database**: PostgreSQL (pg)
+- **Deploy**: Railway
+
+---
+
+## Contributing
+
+PRs welcome. Keep it simple.
+
+---
+
+## License
+
+MIT
+
+---
+
+Built for [Quorum](https://github.com/aetos53t/agent-multisig-api) by [The House of Set](https://github.com/houseof-set) 🏛️
