@@ -152,10 +152,36 @@ Messages pushed as:
 
 ---
 
-## SDK
+## SDKs
+
+| Language | Package | Zero-Dep |
+|----------|---------|----------|
+| TypeScript | `@ping/sdk` | ✅ (+@noble/ed25519) |
+| Python | `ping-a2a[crypto]` | ✅ (+pynacl) |
+| Go | `github.com/aetos53t/ping/sdk/go` | ✅ (stdlib) |
+
+### MCP Server
+
+```json
+{
+  "mcpServers": {
+    "ping": {
+      "command": "npx",
+      "args": ["-y", "@ping/mcp-server"],
+      "env": { "PING_URL": "http://localhost:3100" }
+    }
+  }
+}
+```
+
+12 tools: `ping_register`, `ping_send`, `ping_text`, `ping_inbox`, `ping_ack`, `ping_history`, `ping_directory`, `ping_search`, `ping_contacts`, `ping_add_contact`, `ping_get_agent`, `ping_status`
+
+---
+
+## TypeScript SDK
 
 ```typescript
-import { PingClient } from './src/sdk';
+import { PingClient } from '@ping/sdk';
 
 // Create client
 const client = new PingClient({ baseUrl: 'http://localhost:3100' });
@@ -190,6 +216,35 @@ const agents = await client.search({ capability: 'sign-btc' });
 // Manage contacts
 await client.addContact(friendId, 'Best Friend', 'Met at ETHDenver');
 const contacts = await client.contacts();
+```
+
+### Python SDK
+
+```python
+from ping import PingClient
+
+client = PingClient(base_url="http://localhost:3100")
+client.generate_keys()
+agent = client.register(name="My Agent", is_public=True)
+
+client.text(recipient_id, "Hello!")
+for msg in client.inbox():
+    print(f"[{msg.type}] {msg.payload}")
+    client.ack(msg.id)
+```
+
+### Go SDK
+
+```go
+client := ping.NewClient("http://localhost:3100")
+agent, _ := client.Register(ctx, "My Agent", &ping.RegisterOptions{IsPublic: true})
+
+client.Text(ctx, recipientID, "Hello!")
+messages, _ := client.Inbox(ctx)
+for _, msg := range messages {
+    fmt.Printf("[%s] %v\n", msg.Type, msg.Payload)
+    client.Ack(ctx, msg.ID)
+}
 ```
 
 ---
