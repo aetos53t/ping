@@ -7,6 +7,7 @@
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
     "test": "bun test",
+    "test:integration": "npx tsx test/integration.ts",
     "demo": "bun run test/demo.ts"
   },
   "dependencies": {
@@ -18,6 +19,7 @@
   "devDependencies": {
     "@types/bun": "latest",
     "@types/pg": "^8.10.0",
+    "tsx": "^4.0.0",
     "typescript": "^5.0.0"
   },
   "repository": {
