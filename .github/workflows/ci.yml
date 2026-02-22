@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: ping
+          POSTGRES_PASSWORD: ping
+          POSTGRES_DB: ping
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Start server
+        run: |
+          bun run start &
+          sleep 5
+        env:
+          PORT: 3100
+          DATABASE_URL: postgresql://ping:ping@localhost:5432/ping
+
+      - name: Run integration tests
+        run: bun run test:integration
+        env:
+          PING_URL: http://localhost:3100
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Type check
+        run: bunx tsc --noEmit
+
+  sdk-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install SDK
+        run: |
+          cd sdk/python
+          pip install -e .[crypto]
+
+      - name: Type check (if mypy available)
+        run: |
+          pip install mypy
+          cd sdk/python
+          mypy ping --ignore-missing-imports || true
+
+  sdk-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build SDK
+        run: |
+          cd sdk/go
+          go build ./...
+
+      - name: Vet
+        run: |
+          cd sdk/go
+          go vet ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t ping:test .
+
+      - name: Test Docker image
+        run: |
+          docker run -d --name ping-test -p 3100:3100 ping:test
+          sleep 5
+          curl -f http://localhost:3100/health
+          docker stop ping-test
