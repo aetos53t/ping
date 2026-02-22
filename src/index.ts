@@ -8,6 +8,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { prettyJSON } from 'hono/pretty-json';
+import { serveStatic } from 'hono/bun';
 import * as ed from '@noble/ed25519';
 import { sha512 } from '@noble/hashes/sha512';
 import { db, type Agent, type Message } from './db';
@@ -121,6 +122,14 @@ function deliverWebSocket(agentId: string, message: Message): boolean {
 
   return delivered;
 }
+
+// ════════════════════════════════════════════════════════════════
+//                         ROUTES: STATIC
+// ════════════════════════════════════════════════════════════════
+
+// Serve landing page
+app.get('/landing', serveStatic({ path: './landing/index.html' }));
+app.get('/docs', serveStatic({ path: './docs/openapi.yaml' }));
 
 // ════════════════════════════════════════════════════════════════
 //                         ROUTES: HEALTH
